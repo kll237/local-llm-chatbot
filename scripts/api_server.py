@@ -1,21 +1,44 @@
 # api_server.py - 针对 Qwen2-0.5B 优化的完整版本
+# 新增能力：
+#   1) Redis 对话上下文缓存（可选，连不上时自动回退进程内存）
+#   2) SSE 流式生成（/api/chat/stream）
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from pydantic import BaseModel
 from typing import Optional, List
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
 import torch
 import uvicorn
 import os
 import time
 import re
+import json
+import uuid
+import threading
+import asyncio
 
-# 配置
+# redis 为可选依赖：未安装或连接失败时自动回退到进程内存，保证服务可独立运行
+try:
+    import redis as redis_lib
+except ImportError:
+    redis_lib = None
+
+# ========== 配置 ==========
 # 模型路径：相对项目根目录自动解析，避免硬编码绝对路径，便于克隆后直接运行
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.path.join(PROJECT_ROOT, 'models', 'Qwen2-0.5B-Instruct')
+
+# 上下文存储（Redis / 内存）相关配置，均可通过环境变量覆盖
+REDIS_ENABLED = os.environ.get("REDIS_ENABLED", "auto").lower()  # true / false / auto
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
+REDIS_TTL = int(os.environ.get("REDIS_TTL", "3600"))          # 会话上下文过期时间（秒）
+CONTEXT_MAX_TURNS = int(os.environ.get("CONTEXT_MAX_TURNS", "20"))  # 单会话保留的最大消息条数
+
+DEFAULT_SYSTEM = "你是一个有帮助的AI助手。请用中文简洁明了地回答用户的问题。如果不知道答案，请诚实地说明。"
 
 # 检查模型路径
 if not os.path.exists(MODEL_PATH):
@@ -28,7 +51,78 @@ model = None
 model_loaded = False
 
 
-# 数据模型
+# ========== 上下文存储（Redis / 内存） ==========
+class ContextStore:
+    """多轮对话上下文存储。
+
+    - REDIS_ENABLED=true/false 强制开启/关闭 Redis；
+    - REDIS_ENABLED=auto（默认）时，探测 Redis 是否可达，可达则用 Redis，否则回退内存。
+    Redis 中以 `chat:ctx:{session_id}` 为 key 保存 JSON 化的消息列表，并带 TTL。
+    """
+
+    def __init__(self):
+        self.backend = "memory"
+        self._mem = {}  # session_id -> list[{role, content}]
+        self.redis = None
+
+        if REDIS_ENABLED == "false":
+            print("🧠 上下文存储后端: memory（已通过 REDIS_ENABLED=false 禁用 Redis）")
+            return
+
+        if redis_lib is None:
+            print("🧠 上下文存储后端: memory（未安装 redis 包，pip install redis 后可启用）")
+            return
+
+        try:
+            self.redis = redis_lib.Redis(
+                host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
+                decode_responses=True, socket_connect_timeout=2, socket_timeout=2,
+            )
+            self.redis.ping()
+            self.backend = "redis"
+            print(f"🧠 上下文存储后端: redis（{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}，TTL={REDIS_TTL}s）")
+        except Exception as e:
+            self.redis = None
+            print(f"⚠️ Redis 不可用（{e}），回退到进程内存存储（重启服务后上下文清空）")
+
+    def _key(self, sid):
+        return f"chat:ctx:{sid}"
+
+    def get(self, sid):
+        if self.backend == "redis" and self.redis:
+            raw = self.redis.get(self._key(sid))
+            return json.loads(raw) if raw else []
+        return self._mem.get(sid, [])
+
+    def set(self, sid, history):
+        # 超出上限时裁剪：保留 system 消息 + 最近的 (MAX_TURNS-1) 条
+        if len(history) > CONTEXT_MAX_TURNS:
+            sys_msgs = [m for m in history if m.get("role") == "system"]
+            rest = [m for m in history if m.get("role") != "system"]
+            keep = rest[-(CONTEXT_MAX_TURNS - 1):] if sys_msgs else rest[-CONTEXT_MAX_TURNS:]
+            history = sys_msgs + keep
+        if self.backend == "redis" and self.redis:
+            self.redis.set(self._key(sid), json.dumps(history, ensure_ascii=False), ex=REDIS_TTL)
+        else:
+            self._mem[sid] = history
+        return history
+
+    def clear(self, sid):
+        if self.backend == "redis" and self.redis:
+            self.redis.delete(self._key(sid))
+        else:
+            self._mem.pop(sid, None)
+
+    def ttl(self, sid):
+        if self.backend == "redis" and self.redis:
+            return self.redis.ttl(self._key(sid))
+        return None
+
+
+store = ContextStore()
+
+
+# ========== 数据模型 ==========
 class Message(BaseModel):
     role: str  # "system", "user", "assistant"
     content: str
@@ -39,17 +133,20 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = 150
     temperature: Optional[float] = 0.7
     top_p: Optional[float] = 0.9
+    # 会话 ID：传入后服务端在 Redis/内存中维护多轮上下文；不传则为无状态单轮
+    session_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     reply: str
+    session_id: Optional[str] = None
 
 
 # 创建 FastAPI 应用
 app = FastAPI(
     title="Qwen2-0.5B 聊天机器人 API",
     description="本地部署的聊天机器人服务",
-    version="1.0.0",
+    version="2.0.0",
     docs_url=None,
     redoc_url=None,
 )
@@ -115,7 +212,7 @@ def load_model():
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_PATH,
             local_files_only=True,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
             trust_remote_code=True
         )
 
@@ -200,6 +297,155 @@ def clean_response(text, prompt):
     return response
 
 
+def default_reply(topic):
+    """当模型输出过短或为空时的兜底回复"""
+    return (
+        f"关于'{topic}'，这是一个很好的问题。作为一个小型AI模型，我的回答可能不够详尽，建议你：\n"
+        "1. 查阅相关文档\n2. 搜索更多资料\n3. 尝试询问更具体的问题"
+    )
+
+
+def build_context_messages(request: ChatRequest) -> List[Message]:
+    """根据是否带 session_id 解析本次生成所用的消息列表。
+
+    带 session_id：从 Redis/内存读取历史，拼接本次请求中的用户消息（建议每轮只发新消息），
+                  首次请求可用 system 消息设定人设，后续请求中的 system 会被忽略。
+    不带 session_id：无状态，沿用原逻辑仅保留最近 2 条用户消息。
+    """
+    if request.session_id:
+        hist = store.get(request.session_id)
+        msgs = [Message(role=m["role"], content=m["content"]) for m in hist]
+        req_system = next((m for m in request.messages if m.role == "system"), None)
+        if not any(m.role == "system" for m in msgs):
+            sys_content = req_system.content if req_system else DEFAULT_SYSTEM
+            msgs.insert(0, Message(role="system", content=sys_content))
+        # 仅追加请求中非 system 的消息（约定每轮只传新消息）
+        for m in request.messages:
+            if m.role != "system":
+                msgs.append(m)
+        return msgs
+
+    # 无状态路径：原逻辑
+    messages = []
+    if not any(m.role == "system" for m in request.messages):
+        messages.append(Message(role="system", content=DEFAULT_SYSTEM))
+    user_messages = [m for m in request.messages if m.role == "user"]
+    recent_user_messages = user_messages[-2:] if len(user_messages) > 2 else user_messages
+    messages.extend(recent_user_messages)
+    return messages
+
+
+def persist_context(request: ChatRequest, prior_msgs: List[Message], reply: str):
+    """将本轮（历史 + 新用户消息 + 模型回复）写回 Redis/内存"""
+    if not request.session_id:
+        return
+    history = [{"role": m.role, "content": m.content} for m in prior_msgs]
+    history.append({"role": "assistant", "content": reply})
+    store.set(request.session_id, history)
+
+
+def generate_reply(messages, max_tokens, temperature, top_p):
+    """非流式生成：整句返回并做后处理"""
+    prompt = build_qwen2_prompt(messages)
+    print(f"📝 Prompt预览: {prompt[:200]}...")
+
+    inputs = tokenizer(
+        prompt, return_tensors="pt", max_length=1024, truncation=True, padding=True
+    )
+    device = model.device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    max_new_tokens = min(max_tokens, 300)
+    temperature = max(min(temperature, 1.0), 0.1)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=3,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
+        )
+
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
+    reply = clean_response(generated_text, prompt)
+
+    last_user = next((m.content for m in messages if m.role == "user"), "这个问题")
+    if not reply or len(reply.strip()) < 3:
+        reply = default_reply(last_user)
+    reply = reply[:500]
+    return reply
+
+
+def stream_reply(messages, max_tokens, temperature, top_p):
+    """流式生成：在后台线程执行 model.generate，通过 TextIteratorStreamer 逐 token 产出。
+    返回生成器，产出经过后处理（去除特殊标记）的文本片段。"""
+    prompt = build_qwen2_prompt(messages)
+    print(f"📝 [stream] Prompt预览: {prompt[:200]}...")
+
+    inputs = tokenizer(
+        prompt, return_tensors="pt", max_length=1024, truncation=True, padding=True
+    )
+    device = model.device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    max_new_tokens = min(max_tokens, 300)
+    temperature = max(min(temperature, 1.0), 0.1)
+
+    streamer = TextIteratorStreamer(
+        tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+    gen_kwargs = dict(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        do_sample=True,
+        repetition_penalty=1.2,
+        no_repeat_ngram_size=3,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
+        streamer=streamer,
+    )
+
+    thread = threading.Thread(target=model.generate, kwargs=gen_kwargs)
+    thread.start()
+
+    for token_text in streamer:
+        yield token_text
+
+    thread.join()
+
+
+def event_generator(request: ChatRequest, messages: List[Message]):
+    """SSE 事件生成器：逐 token 推送 {token, done}，结束时推送 {done:true, reply}。"""
+    accumulated = []
+    for piece in stream_reply(messages, request.max_tokens, request.temperature, request.top_p):
+        accumulated.append(piece)
+        data = json.dumps({"token": piece, "done": False}, ensure_ascii=False)
+        yield f"data: {data}\n\n"
+
+    reply = "".join(accumulated)
+    last_user = next((m.content for m in messages if m.role == "user"), "这个问题")
+    if not reply or len(reply.strip()) < 3:
+        reply = default_reply(last_user)
+    reply = reply[:500]
+
+    persist_context(request, messages, reply)
+
+    data = json.dumps(
+        {"token": "", "done": True, "reply": reply, "session_id": request.session_id},
+        ensure_ascii=False,
+    )
+    yield f"data: {data}\n\n"
+
+
 # ========== 路由定义 ==========
 
 @app.get("/")
@@ -209,13 +455,17 @@ async def root():
         "service": "Qwen2-0.5B 聊天机器人 API",
         "status": "running",
         "model_loaded": model_loaded,
+        "context_backend": store.backend,
         "model_info": "Qwen2-0.5B-Instruct (小型模型，适合简单对话)",
         "endpoints": {
             "GET /": "此页面",
             "GET /health": "健康检查",
             "GET /info": "服务器信息",
-            "POST /api/chat": "聊天接口",
-            "GET /test-page": "完整测试页面",
+            "POST /api/chat": "聊天接口（整句返回，支持 session_id 多轮上下文）",
+            "POST /api/chat/stream": "流式聊天接口（SSE，逐 token 返回）",
+            "GET /api/session/{id}": "查看会话上下文",
+            "DELETE /api/session/{id}": "清理会话上下文",
+            "GET /test-page": "完整测试页面（支持流式+多轮）",
             "GET /docs": "API文档",
             "POST /api/test": "简单测试接口"
         },
@@ -229,6 +479,7 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": model_loaded,
+        "context_backend": store.backend,
         "timestamp": time.time(),
         "message": "服务正常运行" if model_loaded else "服务运行但模型未加载"
     }
@@ -244,97 +495,32 @@ async def server_info():
         "model_name": "Qwen2-0.5B-Instruct",
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),
-        "device": str(model.device) if model else "none"
+        "device": str(model.device) if model else "none",
+        "context_backend": store.backend,
+        "redis_enabled": REDIS_ENABLED,
     }
 
 
-# ========== 核心聊天接口 ==========
+# ========== 核心聊天接口（整句返回） ==========
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """聊天接口 - 针对 Qwen2-0.5B 优化"""
+    """聊天接口 - 支持 session_id 多轮上下文"""
 
     if not model_loaded:
         raise HTTPException(status_code=503, detail="模型未加载，请检查模型文件")
 
     try:
         start_time = time.time()
-
-        # 1. 准备消息
-        messages = []
-
-        # 如果没有 system 消息，添加一个默认的
-        has_system = any(msg.role == "system" for msg in request.messages)
-        if not has_system:
-            messages.append(Message(
-                role="system",
-                content="你是一个有帮助的AI助手。请用中文简洁明了地回答用户的问题。如果不知道答案，请诚实地说明。"
-            ))
-
-        # 添加用户消息（只保留最近的2条用户消息，避免太长）
-        user_messages = [msg for msg in request.messages if msg.role == "user"]
-        recent_user_messages = user_messages[-2:] if len(user_messages) > 2 else user_messages
-
-        for msg in recent_user_messages:
-            messages.append(msg)
-
-        # 2. 构建 Qwen2 格式的 prompt
-        prompt = build_qwen2_prompt(messages)
-
-        print(f"📝 Prompt预览: {prompt[:200]}...")
-
-        # 3. 编码
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            max_length=1024,
-            truncation=True,
-            padding=True
-        )
-
-        # 4. 移动到正确的设备
-        device = model.device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        # 5. 生成参数（针对小模型优化）
-        max_new_tokens = min(request.max_tokens, 300)  # 小模型限制长度
-        temperature = max(min(request.temperature, 1.0), 0.1)  # 合理范围
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=request.top_p,
-                do_sample=True,
-                repetition_penalty=1.2,  # 防止重复
-                no_repeat_ngram_size=3,  # 防止3-gram重复
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else None,
-                early_stopping=True
-            )
-
-        # 6. 解码
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
-
-        # 7. 清理响应
-        reply = clean_response(generated_text, prompt)
-
-        # 8. 后处理
-        if not reply or len(reply.strip()) < 3:
-            # 如果回复太短或无意义，提供默认回复
-            last_user_message = recent_user_messages[-1].content if recent_user_messages else "这个问题"
-            reply = f"关于'{last_user_message}'，这是一个很好的问题。作为一个小型AI模型，我的回答可能不够详尽，建议你：\n1. 查阅相关文档\n2. 搜索更多资料\n3. 尝试询问更具体的问题"
-
-        # 限制回复长度
-        reply = reply[:500]
+        messages = build_context_messages(request)
+        reply = generate_reply(messages, request.max_tokens, request.temperature, request.top_p)
+        persist_context(request, messages, reply)
 
         elapsed = time.time() - start_time
         print(f"✅ 生成完成 - 耗时: {elapsed:.2f}s, 回复长度: {len(reply)}")
         print(f"🤖 回复: {reply[:100]}...")
 
-        return ChatResponse(reply=reply)
+        return ChatResponse(reply=reply, session_id=request.session_id)
 
     except torch.cuda.OutOfMemoryError:
         raise HTTPException(status_code=500, detail="GPU内存不足，尝试减少max_tokens")
@@ -342,10 +528,68 @@ async def chat(request: ChatRequest):
         print(f"❌ 生成错误: {str(e)}")
         import traceback
         traceback.print_exc()
-
-        # 返回友好的错误信息
         error_msg = f"生成失败: {str(e)[:100]}"
         return ChatResponse(reply=f"抱歉，处理请求时出现错误。{error_msg}")
+
+
+# ========== 流式聊天接口（SSE） ==========
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """流式聊天接口 - SSE 逐 token 推送。
+
+    请求体同 /api/chat（建议携带 session_id 以启用多轮上下文）。
+    响应格式为 text/event-stream，每个事件形如：
+        data: {"token": "你", "done": false}
+        data: {"token": "好", "done": false}
+        ...
+        data: {"token": "", "done": true, "reply": "你好...", "session_id": "xxx"}
+    """
+    if not model_loaded:
+        raise HTTPException(status_code=503, detail="模型未加载，请检查模型文件")
+
+    try:
+        messages = build_context_messages(request)
+        return StreamingResponse(
+            event_generator(request, messages),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # 关闭代理缓冲，保证逐 token 到达
+            },
+        )
+    except Exception as e:
+        print(f"❌ 流式生成错误: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"流式生成失败: {str(e)[:120]}")
+
+
+# ========== 会话上下文管理 ==========
+
+@app.get("/api/session/{session_id}")
+async def get_session(session_id: str):
+    """查看某会话的上下文消息列表"""
+    import re as _re
+    sid = _re.sub(r'[^A-Za-z0-9_\-]', '', session_id) or "default"
+    history = store.get(sid)
+    return {
+        "session_id": sid,
+        "backend": store.backend,
+        "ttl": store.ttl(sid),
+        "turns": len(history),
+        "messages": history,
+    }
+
+
+@app.delete("/api/session/{session_id}")
+async def delete_session(session_id: str):
+    """清理某会话的上下文"""
+    import re as _re
+    sid = _re.sub(r'[^A-Za-z0-9_\-]', '', session_id) or "default"
+    store.clear(sid)
+    return {"session_id": sid, "cleared": True}
 
 
 # ========== 简单测试接口 ==========
@@ -380,7 +624,7 @@ async def test_chat():
 
 @app.get("/test-page")
 async def test_page():
-    """完整的前端测试页面"""
+    """完整的前端测试页面（支持流式输出与多轮会话）"""
     html = """
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -527,6 +771,7 @@ async def test_page():
                 border-radius: 18px;
                 line-height: 1.5;
                 word-wrap: break-word;
+                white-space: pre-wrap;
             }
             .user .message-content {
                 background: #1890ff;
@@ -649,7 +894,7 @@ async def test_page():
         <div class="container">
             <div class="header">
                 <h1>Qwen2-0.5B 聊天机器人</h1>
-                <div class="model-info">小型模型测试版 - 适合简单对话和测试</div>
+                <div class="model-info">支持流式输出 + 多轮会话（Redis/内存上下文）</div>
             </div>
 
             <div class="status-bar">
@@ -659,6 +904,7 @@ async def test_page():
                 </div>
                 <div class="controls">
                     <button class="btn btn-secondary" onclick="checkStatus()">检查状态</button>
+                    <button class="btn btn-secondary" onclick="newSession()">新建会话</button>
                     <button class="btn btn-secondary" onclick="clearChat()">清空聊天</button>
                     <button class="btn btn-primary" onclick="runTest()">运行测试</button>
                 </div>
@@ -678,7 +924,7 @@ async def test_page():
                     <div class="messages" id="messages">
                         <div class="message bot">
                             <div class="message-content">
-                                你好！我是基于 Qwen2-0.5B 模型的 AI 助手。由于我是小型模型，回答可能比较简短，但我会尽力帮助你！
+                                你好！我是基于 Qwen2-0.5B 模型的 AI 助手。支持流式逐字输出，并会记住本会话的上下文。
                             </div>
                             <div class="message-time">系统</div>
                         </div>
@@ -714,32 +960,40 @@ async def test_page():
             const API_BASE = 'http://localhost:8000';
             let isTyping = false;
 
+            // 会话 ID：本地保存，用于多轮上下文（服务端 Redis/内存中维护）
+            function getSessionId() {
+                let s = localStorage.getItem('chat_session');
+                if (!s) {
+                    s = 'sess-' + Math.random().toString(36).slice(2, 10);
+                    localStorage.setItem('chat_session', s);
+                }
+                return s;
+            }
+            function newSession() {
+                localStorage.removeItem('chat_session');
+                fetch(API_BASE + '/api/session/' + encodeURIComponent(getSessionId()), {method:'DELETE'}).catch(()=>{});
+                clearChat();
+            }
+
             // 页面加载时初始化
             window.onload = function() {
                 checkStatus();
                 loadSystemInfo();
-
-                // 聚焦输入框
                 document.getElementById('messageInput').focus();
             };
 
             // 检查API状态
             async function checkStatus() {
                 const statusText = document.getElementById('status-text');
-
                 try {
                     const response = await fetch(API_BASE + '/health');
                     const data = await response.json();
-
                     if (data.model_loaded) {
                         statusText.innerHTML = '<span style="color:#52c41a">✅ 连接正常 - 模型已加载</span>';
                     } else {
                         statusText.innerHTML = '<span style="color:#faad14">⚠️ 连接正常 - 但模型未加载</span>';
                     }
-
-                    // 更新系统信息
                     loadSystemInfo();
-
                 } catch (error) {
                     statusText.innerHTML = '<span style="color:#ff4d4f">❌ 无法连接到API服务器</span>';
                     console.error('连接错误:', error);
@@ -749,11 +1003,9 @@ async def test_page():
             // 加载系统信息
             async function loadSystemInfo() {
                 const infoGrid = document.getElementById('infoGrid');
-
                 try {
                     const response = await fetch(API_BASE + '/info');
                     const data = await response.json();
-
                     infoGrid.innerHTML = `
                         <div class="info-item">
                             <div class="info-label">模型状态</div>
@@ -768,11 +1020,10 @@ async def test_page():
                             <div class="info-value">${data.cuda_available ? '可用' : '不可用'}</div>
                         </div>
                         <div class="info-item">
-                            <div class="info-label">PyTorch</div>
-                            <div class="info-value">${data.torch_version}</div>
+                            <div class="info-label">上下文后端</div>
+                            <div class="info-value">${data.context_backend}</div>
                         </div>
                     `;
-
                 } catch (error) {
                     infoGrid.innerHTML = `
                         <div class="info-item">
@@ -783,60 +1034,70 @@ async def test_page():
                 }
             }
 
-            // 发送消息
+            function scrollBottom() {
+                const m = document.getElementById('messages');
+                m.scrollTop = m.scrollHeight;
+            }
+
+            // 发送（流式）
             async function sendMessage() {
                 const input = document.getElementById('messageInput');
                 const message = input.value.trim();
-
                 if (!message || isTyping) return;
-
-                // 显示用户消息
                 addMessage('user', message);
                 input.value = '';
-
-                // 显示输入中状态
                 showTyping(true);
-
                 try {
-                    // 发送请求
-                    const response = await fetch(API_BASE + '/api/chat', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify({
-                            messages: [
-                                {
-                                    role: 'system',
-                                    content: '你是一个有帮助的AI助手。请用中文简洁明了地回答用户的问题。如果不知道答案，请诚实地说明。'
-                                },
-                                {
-                                    role: 'user',
-                                    content: message
-                                }
-                            ],
-                            max_tokens: 200,
-                            temperature: 0.7
-                        })
-                    });
-
-                    if (!response.ok) {
-                        throw new Error(`HTTP错误: ${response.status}`);
-                    }
-
-                    const data = await response.json();
-
-                    // 隐藏输入中状态
-                    showTyping(false);
-
-                    // 显示回复
-                    addMessage('bot', data.reply);
-
+                    await streamChat(message);
                 } catch (error) {
                     showTyping(false);
-                    console.error('发送消息失败:', error);
                     addMessage('bot', '抱歉，出错了: ' + error.message);
                 }
+            }
+
+            // 流式调用 /api/chat/stream，逐 token 渲染
+            async function streamChat(userText) {
+                const sessionId = getSessionId();
+                const res = await fetch(API_BASE + '/api/chat/stream', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        messages: [{role: 'user', content: userText}],
+                        max_tokens: 200,
+                        temperature: 0.7
+                    })
+                });
+                if (!res.ok) {
+                    showTyping(false);
+                    addMessage('bot', '请求失败: HTTP ' + res.status);
+                    return;
+                }
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let buf = '';
+                let full = '';
+                const contentEl = addStreamingMessage();
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, {stream: true});
+                    let idx;
+                    while ((idx = buf.indexOf('\\n\\n')) !== -1) {
+                        const chunk = buf.slice(0, idx);
+                        buf = buf.slice(idx + 2);
+                        const dataLine = chunk.split('\\n').find(l => l.startsWith('data:'));
+                        if (!dataLine) continue;
+                        let payload;
+                        try { payload = JSON.parse(dataLine.slice(5).trim()); } catch(e) { continue; }
+                        if (payload.token) {
+                            full += payload.token;
+                            contentEl.textContent = full;
+                            scrollBottom();
+                        }
+                    }
+                }
+                showTyping(false);
             }
 
             // 发送示例问题
@@ -845,7 +1106,7 @@ async def test_page():
                 sendMessage();
             }
 
-            // 运行测试
+            // 运行测试（非流式，无状态）
             async function runTest() {
                 const testQuestions = [
                     "你好",
@@ -853,11 +1114,9 @@ async def test_page():
                     "什么是机器学习",
                     "写一个Python的hello world程序"
                 ];
-
                 for (const question of testQuestions) {
                     addMessage('user', question);
                     showTyping(true);
-
                     try {
                         const response = await fetch(API_BASE + '/api/chat', {
                             method: 'POST',
@@ -867,14 +1126,10 @@ async def test_page():
                                 max_tokens: 150
                             })
                         });
-
                         const data = await response.json();
                         showTyping(false);
                         addMessage('bot', data.reply);
-
-                        // 等待1秒
                         await new Promise(resolve => setTimeout(resolve, 1000));
-
                     } catch (error) {
                         showTyping(false);
                         addMessage('bot', '测试失败: ' + error.message);
@@ -883,33 +1138,40 @@ async def test_page():
                 }
             }
 
-            // 添加消息到聊天区域
+            // 添加普通消息
             function addMessage(type, content) {
                 const messagesDiv = document.getElementById('messages');
                 const messageDiv = document.createElement('div');
-
-                const timeStr = new Date().toLocaleTimeString('zh-CN', { 
-                    hour: '2-digit', 
-                    minute: '2-digit' 
-                });
-
+                const timeStr = new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
                 messageDiv.className = `message ${type}`;
                 messageDiv.innerHTML = `
                     <div class="message-content">${content}</div>
                     <div class="message-time">${timeStr}</div>
                 `;
-
                 messagesDiv.appendChild(messageDiv);
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                scrollBottom();
+            }
+
+            // 添加流式消息占位（返回内容元素，便于逐 token 更新）
+            function addStreamingMessage() {
+                const messagesDiv = document.getElementById('messages');
+                const messageDiv = document.createElement('div');
+                const timeStr = new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'});
+                messageDiv.className = 'message bot';
+                messageDiv.innerHTML = `
+                    <div class="message-content"></div>
+                    <div class="message-time">${timeStr}</div>
+                `;
+                messagesDiv.appendChild(messageDiv);
+                scrollBottom();
+                return messageDiv.querySelector('.message-content');
             }
 
             // 显示/隐藏输入中状态
             function showTyping(show) {
                 const typingIndicator = document.getElementById('typingIndicator');
                 const sendButton = document.getElementById('sendButton');
-
                 isTyping = show;
-
                 if (show) {
                     typingIndicator.style.display = 'block';
                     sendButton.disabled = true;
@@ -919,10 +1181,7 @@ async def test_page():
                     sendButton.disabled = false;
                     sendButton.textContent = '发送';
                 }
-
-                // 滚动到底部
-                const messagesDiv = document.getElementById('messages');
-                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                scrollBottom();
             }
 
             // 清空聊天
@@ -938,14 +1197,9 @@ async def test_page():
                 `;
             }
 
-            // 监听输入框回车键
             document.getElementById('messageInput').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    sendMessage();
-                }
+                if (e.key === 'Enter') sendMessage();
             });
-
-            // 自动调整输入框高度
             document.getElementById('messageInput').addEventListener('input', function() {
                 this.style.height = 'auto';
                 this.style.height = (this.scrollHeight) + 'px';
@@ -966,6 +1220,7 @@ if __name__ == '__main__':
     print(f"📦 模型存在: {'✅' if os.path.exists(MODEL_PATH) else '❌'}")
     print(f"⚡ CUDA 可用: {'✅' if torch.cuda.is_available() else '❌'}")
     print(f"🔧 PyTorch 版本: {torch.__version__}")
+    print(f"🧠 上下文后端: {store.backend}")
     print("=" * 70)
     print("🌐 重要访问地址:")
     print("1. 🏠 API首页: http://localhost:8000/")
@@ -975,17 +1230,16 @@ if __name__ == '__main__':
     print("💡 使用说明:")
     print("• 这是 0.5B 小型模型，回答会比较简短")
     print("• 建议问一些简单直接的问题")
-    print("• 如果回答不理想，可以尝试重新提问")
+    print("• 流式接口: POST /api/chat/stream；多轮上下文: 传入 session_id")
     print("=" * 70)
-    print("🛠️ 快速测试命令:")
-    print('curl -X POST http://localhost:8000/api/chat \\')
+    print("🛠️ 快速测试命令（流式）:")
+    print('curl -N -X POST http://localhost:8000/api/chat/stream \\')
     print('  -H "Content-Type: application/json" \\')
-    print('  -d \'{"messages":[{"role":"user","content":"你好"}], "max_tokens":100}\'')
+    print('  -d \'{"session_id":"demo","messages":[{"role":"user","content":"你好"}],"max_tokens":120}\'')
     print("=" * 70)
     print("按 Ctrl+C 停止服务器")
     print("=" * 70)
 
-    # 运行服务器
     uvicorn.run(
         app,
         host='0.0.0.0',

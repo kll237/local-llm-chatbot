@@ -10,8 +10,10 @@
 
 ### 1) 本地大模型推理（FastAPI 服务）
 - 基于 `Transformers + PyTorch` 本地加载 Qwen2-0.5B-Instruct，离线推理。
-- 提供 `/api/chat` 对话接口、内置 HTML 测试页 `/test-page`、健康检查 `/health` 与接口信息 `/info`。
-- 兼容 Qwen2 的 ChatML 对话模板（`<|im_start|>...<|im_end|>`），支持多轮上下文。
+- 提供两种对话接口：整句返回的 `POST /api/chat`，以及 **SSE 逐 token 流式输出**的 `POST /api/chat/stream`。
+- 内置 HTML 测试页 `/test-page`（已支持流式渲染与多轮会话）、健康检查 `/health`、接口信息 `/info`、Swagger 文档 `/docs`。
+- 兼容 Qwen2 的 ChatML 对话模板（`<|im_start|>...<|im_end|>`）。
+- **多轮对话上下文**：通过 `session_id` 在 Redis（可选）或进程内存中维护会话历史，支持跨请求记忆；并提供 `GET /api/session/{id}`、`DELETE /api/session/{id}` 查看 / 清理会话。
 
 ### 2) 命令行对话（CLI）
 - `chatbot.py` 提供终端交互式对话，内部维护 `conversation_history` 实现多轮记忆。
@@ -38,7 +40,8 @@
 ┌───────────────────────────▼─────────────────────────────────┐
 │                   scripts/api_server.py (FastAPI)            │
 │   接收 messages 列表 → 构建 ChatML prompt → model.generate   │
-│   端点: /api/chat  /health  /info  /docs  /test-page        │
+│   端点: /api/chat  /api/chat/stream(SSE)  /api/session/{id} │
+│   上下文: ContextStore（Redis 可选，连不上回退进程内存）     │
 └───────────────────────────┬─────────────────────────────────┘
                             │  Transformers + PyTorch
 ┌───────────────────────────▼─────────────────────────────────┐
@@ -53,7 +56,7 @@
 | 层级 | 技术 |
 |------|------|
 | 模型 | Qwen2-0.5B-Instruct（阿里通义千问，0.5B 参数） |
-| 推理框架 | Transformers 4.44.2 + PyTorch 2.9.1 |
+| 推理框架 | Transformers ≥ 4.44.2 + PyTorch 2.9.1 |
 | 服务 | FastAPI + Uvicorn + Pydantic |
 | 训练 | HuggingFace `Trainer` / `DataCollatorForLanguageModeling` |
 | 可视化 | Matplotlib + Seaborn |
@@ -119,6 +122,7 @@ numpy==1.26.4
 scikit-learn==1.5.1
 matplotlib==3.8.4
 seaborn
+redis>=5.0.0
 ```
 
 安装：
@@ -210,9 +214,9 @@ python package_project.py      # 生成 AI_ChatBot_Portable.zip（含 start.bat 
 - 关键超参：`num_train_epochs=1`、`learning_rate=5e-6`、`per_device_train_batch_size=1`。
 - 说明：脚本内当前默认仅取前 20 条样本用于最小可运行验证（`if len(train_dataset) > 20: train_dataset = train_dataset.select(range(20))`）。如需完整训练，请注释该截断逻辑。
 
-### 对话接口（`POST /api/chat`）
+### 对话接口（`POST /api/chat` 与 `POST /api/chat/stream`）
 
-请求体：
+请求体（两个端点通用，`session_id` 可选）：
 
 ```json
 {
@@ -221,17 +225,45 @@ python package_project.py      # 生成 AI_ChatBot_Portable.zip（含 start.bat 
   ],
   "max_tokens": 150,
   "temperature": 0.7,
-  "top_p": 0.9
+  "top_p": 0.9,
+  "session_id": "my-session-001"
 }
 ```
 
-响应：
+- **`POST /api/chat`**：整句返回，`{ "reply": "...", "session_id": "..." }`。未传 `session_id` 时为无状态单轮（沿用原逻辑，仅保留最近 2 条用户消息）。
+- **`POST /api/chat/stream`**：返回 `text/event-stream` 的 SSE 流，逐 token 推送，事件格式：
+  ```text
+  data: {"token": "你", "done": false}
+  data: {"token": "好", "done": false}
+  ...
+  data: {"token": "", "done": true, "reply": "你好！...", "session_id": "my-session-001"}
+  ```
+  生成在后台线程执行，`TextIteratorStreamer` 负责逐 token 产出，前端可用 `fetch` + `ReadableStream` 读取（内置 `/test-page` 已演示）。
 
-```json
-{ "reply": "你好！我是你的AI助手……" }
+**多轮上下文（session_id）**：传入 `session_id` 后，服务端在 Redis 或进程内存中维护该会话的历史消息；客户端**每轮只需发送本次的新消息**（通常为一条 user 消息，首次可附带 system 设定人设）。历史随消息数自动裁剪至最近 `CONTEXT_MAX_TURNS`（默认 20）条。详见第七节会话管理端点。
+
+curl 快速验证（流式）：
+
+```bash
+curl -N -X POST http://localhost:8000/api/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"demo","messages":[{"role":"user","content":"用一句话介绍北京"}],"max_tokens":120}'
 ```
 
-> 多轮上下文：`api_server.py` 接收 `messages` 列表，但为控制长度默认仅保留**最近 2 条用户消息**；`chatbot.py` 则完整维护 `conversation_history`。
+### 上下文存储配置（Redis / 内存）
+
+对话上下文默认保存在**进程内存**；若环境中运行了 Redis，可通过环境变量启用 Redis 后端（重启服务后仍可保留会话、支持跨进程共享）：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `REDIS_ENABLED` | `auto` | `auto`=探测 Redis 可达性；`true`=强制启用；`false`=仅内存 |
+| `REDIS_HOST` | `localhost` | Redis 主机 |
+| `REDIS_PORT` | `6379` | Redis 端口 |
+| `REDIS_DB` | `0` | Redis 库号 |
+| `REDIS_TTL` | `3600` | 会话上下文过期时间（秒） |
+| `CONTEXT_MAX_TURNS` | `20` | 单会话保留的最大消息条数 |
+
+无 Redis 时服务照常运行（自动回退内存），仅重启后上下文清空；`/info` 与 `/health` 会返回当前 `context_backend` 便于排查。
 
 ---
 
@@ -242,9 +274,12 @@ python package_project.py      # 生成 AI_ChatBot_Portable.zip（含 start.bat 
 | GET | `/` | 服务信息（模型状态、端点列表） |
 | GET | `/health` | 健康检查 |
 | GET | `/info` | 服务器信息（模型路径、设备、CUDA、PyTorch 版本） |
-| POST | `/api/chat` | 核心对话接口 |
+| POST | `/api/chat` | 核心对话接口（整句返回，支持 `session_id` 多轮上下文） |
+| POST | `/api/chat/stream` | 流式对话接口（SSE 逐 token 输出） |
+| GET | `/api/session/{id}` | 查看某会话的上下文消息列表 |
+| DELETE | `/api/session/{id}` | 清理某会话的上下文 |
 | POST | `/api/test` | 内置自测接口 |
-| GET | `/test-page` | 内置 HTML 对话测试页 |
+| GET | `/test-page` | 内置 HTML 对话测试页（支持流式 + 多轮） |
 | GET | `/docs` | Swagger 文档 |
 
 ---
@@ -252,6 +287,8 @@ python package_project.py      # 生成 AI_ChatBot_Portable.zip（含 start.bat 
 ## 八、项目优势
 
 - **完全本地 / 离线**：模型权重与推理均在本地，不调用任何云端大模型 API，数据不出本机。
+- **流式交互**：`/api/chat/stream` 提供 SSE 逐 token 输出，前端首字延迟低、体验接近主流对话产品。
+- **多轮会话可缓存**：通过 `session_id` + Redis（可选）/ 内存维护上下文，支持跨请求记忆与会话管理。
 - **轻量可跑**：0.5B 参数模型在普通 CPU 笔记本上即可运行，资源占用低。
 - **端到端闭环**：从数据集、微调、推理服务、评估到打包部署，全流程脚本化、可复现。
 - **开箱即用的界面**：内置 HTML 测试页与命令行两种交互方式，无需额外前端工程。
@@ -266,10 +303,10 @@ python package_project.py      # 生成 AI_ChatBot_Portable.zip（含 start.bat 
 | 原始描述 | 代码实际情况 | 结论 |
 |----------|--------------|------|
 | 基于 Qwen2-0.5B-Instruct，Transformers+PyTorch | `api_server.py` / `chatbot.py` / `model_training.py` 均使用 Transformers + PyTorch 加载 Qwen2-0.5B-Instruct | ✅ 已实现 |
-| 多轮对话管理 | `api_server.py` 接收 `messages` 列表；`chatbot.py` 维护 `conversation_history` | ✅ 已实现（API 侧默认仅保留最近 2 条用户消息） |
-| **流式生成** | 当前 `/api/chat` 为整句返回，未使用 SSE / `StreamingResponse` 逐 token 流式输出 | ⚠️ **未实现**（如需可后续补充 `StreamingResponse`） |
+| 多轮对话管理 | `api_server.py` 通过 `session_id` + `ContextStore` 维护会话历史；`chatbot.py` 维护 `conversation_history` | ✅ 已实现（API 侧支持跨请求多轮记忆，无 session 时为无状态） |
+| **流式生成** | `POST /api/chat/stream` 使用 `StreamingResponse` + SSE + `TextIteratorStreamer`，后台线程执行 `model.generate` 逐 token 推送 | ✅ 已实现 |
 | 模型微调、推理部署全流程 | `model_training.py` 微调 + `api_server.py` 部署 | ✅ 已实现（微调默认仅 20 条样本、1 epoch，属最小验证） |
-| **引入 Redis 缓存对话上下文，优化时延与并发** | 全仓库无任何 Redis 客户端或对话上下文缓存；上下文由进程内 `messages` 列表维护 | ⚠️ **未实现**（Redis 未接入） |
+| **引入 Redis 缓存对话上下文，优化时延与并发** | `ContextStore` 支持 Redis 后端（环境变量启用），连接失败时自动回退进程内存；上下文带 TTL，支持跨进程/跨实例共享 | ✅ 已实现（Redis 为可选依赖，未装/未运行则回退内存） |
 | 工程化启动程序、环境校验、依赖管理、一键打包 | `main.py` 做依赖校验；`package_project.py` 生成 `AI_ChatBot_Portable.zip`（含 start.bat / start.sh） | ✅ 已实现（见下方已知限制） |
 | Windows / Linux 跨平台部署包 | 已生成 `start.bat` 与 `start.sh` | ✅ 已生成，但**非完全离线 / 可移植**（见已知限制） |
 | 训练与性能可视化报告、全链路评估 | `visualization_new.py` 出图；`model_testing.py` 输出词重叠基线评估 | ✅ 已实现（评估为基线级，指标为例示数据，见已知限制） |
@@ -290,16 +327,14 @@ python package_project.py      # 生成 AI_ChatBot_Portable.zip（含 start.bat 
 
 **已知限制（如实说明）**
 
-1. **未接入 Redis**：对话上下文由进程内列表维护，重启即丢失，不支持跨进程 / 跨实例共享。
-2. **未实现流式输出**：`/api/chat` 整句返回，长回复时首字延迟较高。
+1. **Redis 为可选组件**：对话上下文默认存于进程内存，重启即丢失；仅在设置了 `REDIS_ENABLED=true`（或 `auto` 且环境可达）并运行 Redis 时才走 Redis 后端。未装 `redis` 包或未启动 Redis 时自动回退内存，属预期行为。
+2. **流式输出首字仍有模型前向耗时**：`/api/chat/stream` 的逐 token 来自 `TextIteratorStreamer`，但首字需等待一次完整前向；0.5B 模型在 CPU 上首字约数百毫秒至 1 秒级。
 3. **可视化指标为例示数据**：`visualization_new.py` 中的损失、准确率、混淆矩阵为固定示例数组，并非真实测评结果；`model_testing.py` 的自动评估仅为词重叠基线（5 条样本，相似度接近 0），用于演示流程。
 4. **打包产物非完全离线 / 可移植**：`start.bat` / `start.sh` 仍依赖首次联网 `pip install`；`api_server.py` 早期版本模型路径为硬编码绝对路径（已改为相对路径自动解析）；打包脚本原引用了不存在的 `visualization_server.py`（已修正为 `visualization_new.py`）。
 5. **微调规模小**：默认仅 20 条样本、1 epoch，属于可运行验证，非充分训练。
 
 **未来发展方向**
 
-- 接入 Redis 做对话上下文缓存与会话管理，提升并发与重启恢复能力。
-- 使用 `StreamingResponse` + SSE 实现逐 token 流式输出，改善交互体验。
 - 引入 LoRA / QLoRA 降低微调显存占用，并扩大训练数据规模。
 - 将可视化与评估报告对接真实测评指标（BLEU / ROUGE / 人工打分）。
 - 打包时内置依赖与模型下载引导，做到真正离线可分发的便携包。
