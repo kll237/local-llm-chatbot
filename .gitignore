@@ -1,0 +1,28 @@
+# 模型权重与训练产物（体积大，不入库；请按 README 第十节自行下载）
+models/
+AI_ChatBot_Portable.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境
+chatbot_venv/
+
+# IDE
+.idea/
+
+# 运行时数据
+*.db
+database_test.db
+
+# 调试 / 临时 / 遗留脚本
+chat_test_*.json
+debug_*.py
+fix_*.py
+test_*.py
+cs.py
+
+# 打包临时目录
+_package_temp/

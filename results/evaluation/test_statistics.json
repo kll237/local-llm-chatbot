@@ -1,0 +1,7 @@
+{
+  "test_samples": 5,
+  "avg_similarity": 0.0,
+  "length_match_rate": 1.0,
+  "total_test_data": 51,
+  "note": "简单相似度评估（基于词重叠）"
+}
