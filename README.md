@@ -52,8 +52,10 @@
 └─────────────────────────────────────────────────────────────┘
 
 离线训练链路（main.py 编排）:
-  data_processing.py → model_training.py → model_testing.py → visualization_new.py
+  data_processing.py → model_training.py → model_testing.py → scripts/visualization.py
 ```
+
+> 说明：`main.py` 第四步实际调用的是 `scripts/visualization.py`（读取 `results/evaluation_results.csv` 并输出 BLEU/ROUGE 图表）。当前 `model_testing.py` 默认仅输出 `results/evaluation/test_results.csv`（词重叠相似度），与 `scripts/visualization.py` 期望的列格式并不完全一致，直接运行 `main.py` 第四步可能失败；可单独运行 `scripts/model_testing.py` 与 `visualization_new.py`。
 
 ### 架构与流程图（来自实验报告）
 
@@ -99,62 +101,28 @@
 
 ---
 
-## 模型训练、评估与可视化（来自实验报告）
+## 模型训练、评估与可视化（示例数据说明）
 
-本节展示实验报告中记录的训练过程、评估指标与可视化产出。图表为报告中的真实运行截图；当前仓库代码同样支持通过 `main.py` / `scripts/model_training.py` / `scripts/model_testing.py` / `visualization_new.py` 复现该流程。
-
-### 训练过程
-
-<p align="center">
-  <img src="docs/screenshots/training-loss-curve.png" width="80%" alt="模型训练损失曲线">
-  <br>
-  <em>训练损失与验证损失随 epoch 下降曲线</em>
-</p>
-
-### 评估指标
-
-<p align="center">
-  <img src="docs/screenshots/accuracy-metrics.png" width="75%" alt="模型准确率指标">
-  <br>
-  <em>回复相关性、流畅度与信息量准确率</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/confusion-matrix.png" width="75%" alt="模型预测混淆矩阵">
-  <br>
-  <em>闲聊 / 信息查询 / 知识问答 / 技术问题 混淆矩阵</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/response-time-distribution.png" width="80%" alt="模型响应时间分布">
-  <br>
-  <em>响应时间分布近似正态，峰值在 0.7–0.8 秒</em>
-</p>
-
-<p align="center">
-  <img src="docs/screenshots/test-results-by-type.png" width="80%" alt="各类型问题测试结果">
-  <br>
-  <em>简单 / 复杂 / 常识 / 技术问题的回答正确数对比</em>
-</p>
+> 重要说明：`visualization_new.py` 使用硬编码数组生成训练曲线、准确率、混淆矩阵、响应时间、测试结果等示意图表，用于展示可视化能力；这些数值**并非真实模型评估结果**。真实的基线评估由 `scripts/model_testing.py` 输出（词重叠相似度，通常接近 0，详见第十一节）。为避免被误解为真实模型性能，以下不再展示这些示例指标图，仅保留脚本运行截图与评估样例截图。
 
 ### 可视化脚本执行与质量评估
 
 <p align="center">
   <img src="docs/screenshots/visualization-run.png" width="85%" alt="可视化执行过程">
   <br>
-  <em>visualization_new.py 一键生成 5 类图表</em>
+  <em>`visualization_new.py` 运行结果：一键生成 5 类示意图表</em>
 </p>
 
 <p align="center">
   <img src="docs/screenshots/manual-evaluation.png" width="90%" alt="人工评估示例">
   <br>
-  <em>人工评估：输入 transformer / NLP 代码等问题的生成回复</em>
+  <em>人工评估示例：输入 transformer / NLP / 代码等问题的生成回复</em>
 </p>
 
 <p align="center">
   <img src="docs/screenshots/automatic-evaluation.png" width="90%" alt="自动评估示例">
   <br>
-  <em>自动评估：5 组测试用例的期望回复与生成回复对比</em>
+  <em>自动评估示例：5 组测试用例的期望回复与生成回复对比</em>
 </p>
 
 ---
@@ -164,12 +132,12 @@
 ```
 chatbot_project/
 ├── chatbot.py                 # 命令行对话（ChatBot 类，本地 CLI）
-├── main.py                    # 实验流程编排入口（依赖校验 + 数据→训练→测试→可视化）
+├── main.py                    # 实验流程编排入口（依赖校验 + 数据→训练→测试→可视化脚本）
 ├── chat_interface.html        # 独立 Web 对话界面
 ├── show_structure.py          # 打印项目结构
 ├── package_project.py         # 一键打包为跨平台便携包
 ├── visualization_new.py       # 生成结果展示图表（示例数据）
-├── requirements.txt           # 依赖清单（已补全，见第十节）
+├── requirements.txt           # 依赖清单（训练还需额外安装 jieba）
 ├── EXPERIMENT_REPORT.md       # 实验说明
 ├── TRAINING_SUCCESS.txt       # 训练完成标记
 ├── data/
@@ -220,7 +188,7 @@ chatbot_project/
 - **硬件**：CPU 即可运行；有 CUDA 时自动使用 GPU
 - **磁盘**：模型权重 + 虚拟环境约需 5GB 以上
 
-依赖以 `requirements.txt` 为准（已补全实际 import 所需的全部包）：
+依赖以 `requirements.txt` 为准；实际运行 `scripts/model_training.py` 还需要 `jieba`，如进行训练请一并安装：
 
 ```
 torch==2.9.1
@@ -441,7 +409,7 @@ curl -N -X POST http://localhost:8000/api/chat/stream \
 
 1. **Redis 为可选组件**：对话上下文默认存于进程内存，重启即丢失；仅在设置了 `REDIS_ENABLED=true`（或 `auto` 且环境可达）并运行 Redis 时才走 Redis 后端。未装 `redis` 包或未启动 Redis 时自动回退内存，属预期行为。
 2. **流式输出首字仍有模型前向耗时**：`/api/chat/stream` 的逐 token 来自 `TextIteratorStreamer`，但首字需等待一次完整前向；0.5B 模型在 CPU 上首字约数百毫秒至 1 秒级。
-3. **可视化指标为例示数据**：`visualization_new.py` 中的损失、准确率、混淆矩阵为固定示例数组，并非真实测评结果；`model_testing.py` 的自动评估仅为词重叠基线（5 条样本，相似度接近 0），用于演示流程。
+3. **可视化指标为例示数据**：`visualization_new.py` 中的损失、准确率、混淆矩阵、响应时间、测试结果为固定示例数组，并非真实测评结果；README 已将这些示例指标图从展示中移除。`model_testing.py` 的自动评估仅为词重叠基线（5 条样本，相似度通常接近 0），用于演示流程。
 4. **打包产物非完全离线 / 可移植**：`start.bat` / `start.sh` 仍依赖首次联网 `pip install`；`api_server.py` 早期版本模型路径为硬编码绝对路径（已改为相对路径自动解析）；打包脚本原引用了不存在的 `visualization_server.py`（已修正为 `visualization_new.py`）。
 5. **微调规模小**：默认仅 20 条样本、1 epoch，属于可运行验证，非充分训练。
 
