@@ -57,7 +57,7 @@
 
 > 说明：`main.py` 第四步实际调用的是 `scripts/visualization.py`（读取 `results/evaluation_results.csv` 并输出 BLEU/ROUGE 图表）。当前 `model_testing.py` 默认仅输出 `results/evaluation/test_results.csv`（词重叠相似度），与 `scripts/visualization.py` 期望的列格式并不完全一致，直接运行 `main.py` 第四步可能失败；可单独运行 `scripts/model_testing.py` 与 `visualization_new.py`。
 
-### 架构与流程图（来自实验报告）
+### 架构与流程图
 
 <p align="center">
   <img src="docs/screenshots/architecture-diagram.png" width="85%" alt="系统架构图">
@@ -164,7 +164,7 @@ chatbot_project/
 
 ---
 
-## 一键打包与部署（来自实验报告）
+## 一键打包与部署
 
 `package_project.py` 会将项目文件、模型目录、脚本与启动脚本一并打包为 `AI_ChatBot_Portable.zip`，方便在不同机器上解压后一键运行。
 
@@ -421,9 +421,9 @@ curl -N -X POST http://localhost:8000/api/chat/stream \
 
 ---
 
-## 界面与功能演示（来自实验报告）
+## 界面与功能演示
 
-以下截图来自实验报告中的真实运行界面，展示了 API 文档、Web 对话、代码示例、系统状态、发送状态、服务信息、对话日志与模型测试结果。
+以下截图展示了实际运行界面，包括 API 文档、Web 对话、代码示例、系统状态、发送状态、服务信息、对话日志与模型测试结果。
 
 ### API 文档
 
