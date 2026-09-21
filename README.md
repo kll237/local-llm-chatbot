@@ -4,6 +4,8 @@
 
 > 说明：本项目为学习与演示性质。Qwen2-0.5B 是极小参数模型，回答会比较简短、偶有不准确，更适合作为「本地大模型应用工程化」的完整范式示例，而非生产级对话产品。
 
+> 项目背景：本仓库对应《自然语言处理实践》课程期末报告《AI 聊天机器人》（软件工程 · 软件 2327z · 20231614003 · 王嫣然）。下文中的架构图、评估图表、打包截图与界面截图均直接来自该实验报告的真实运行截图。
+
 ---
 
 ## 一、核心功能与界面
@@ -53,6 +55,38 @@
   data_processing.py → model_training.py → model_testing.py → visualization_new.py
 ```
 
+### 架构与流程图（来自实验报告）
+
+<p align="center">
+  <img src="docs/screenshots/architecture-diagram.png" width="85%" alt="系统架构图">
+  <br>
+  <em>系统分层架构：表现层 / 业务层 / 数据层</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/module-diagram.png" width="90%" alt="系统模块划分图">
+  <br>
+  <em>核心模块与职责划分</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/class-diagram.png" width="70%" alt="类图设计">
+  <br>
+  <em>核心类设计与协作关系</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/flowchart.png" width="65%" alt="系统运行流程图">
+  <br>
+  <em>系统启动与请求处理流程</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/data-flow-diagram.png" width="90%" alt="数据流图">
+  <br>
+  <em>用户输入 → 前端界面 → API 服务 → 模型推理 → 生成回复</em>
+</p>
+
 | 层级 | 技术 |
 |------|------|
 | 模型 | Qwen2-0.5B-Instruct（阿里通义千问，0.5B 参数） |
@@ -62,6 +96,66 @@
 | 可视化 | Matplotlib + Seaborn |
 | 数据 | Pandas + scikit-learn（清洗 / 划分） |
 | 部署 | Python 标准库 `zipfile` + 批处理 / Shell 启动脚本 |
+
+---
+
+## 模型训练、评估与可视化（来自实验报告）
+
+本节展示实验报告中记录的训练过程、评估指标与可视化产出。图表为报告中的真实运行截图；当前仓库代码同样支持通过 `main.py` / `scripts/model_training.py` / `scripts/model_testing.py` / `visualization_new.py` 复现该流程。
+
+### 训练过程
+
+<p align="center">
+  <img src="docs/screenshots/training-loss-curve.png" width="80%" alt="模型训练损失曲线">
+  <br>
+  <em>训练损失与验证损失随 epoch 下降曲线</em>
+</p>
+
+### 评估指标
+
+<p align="center">
+  <img src="docs/screenshots/accuracy-metrics.png" width="75%" alt="模型准确率指标">
+  <br>
+  <em>回复相关性、流畅度与信息量准确率</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/confusion-matrix.png" width="75%" alt="模型预测混淆矩阵">
+  <br>
+  <em>闲聊 / 信息查询 / 知识问答 / 技术问题 混淆矩阵</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/response-time-distribution.png" width="80%" alt="模型响应时间分布">
+  <br>
+  <em>响应时间分布近似正态，峰值在 0.7–0.8 秒</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/test-results-by-type.png" width="80%" alt="各类型问题测试结果">
+  <br>
+  <em>简单 / 复杂 / 常识 / 技术问题的回答正确数对比</em>
+</p>
+
+### 可视化脚本执行与质量评估
+
+<p align="center">
+  <img src="docs/screenshots/visualization-run.png" width="85%" alt="可视化执行过程">
+  <br>
+  <em>visualization_new.py 一键生成 5 类图表</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/manual-evaluation.png" width="90%" alt="人工评估示例">
+  <br>
+  <em>人工评估：输入 transformer / NLP 代码等问题的生成回复</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/automatic-evaluation.png" width="90%" alt="自动评估示例">
+  <br>
+  <em>自动评估：5 组测试用例的期望回复与生成回复对比</em>
+</p>
 
 ---
 
@@ -99,6 +193,24 @@ chatbot_project/
 ```
 
 > `models/` 与 `AI_ChatBot_Portable.zip` 体积较大（模型权重约 1GB 级），**不纳入版本库**，请按第十节自行获取。
+
+---
+
+## 一键打包与部署（来自实验报告）
+
+`package_project.py` 会将项目文件、模型目录、脚本与启动脚本一并打包为 `AI_ChatBot_Portable.zip`，方便在不同机器上解压后一键运行。
+
+<p align="center">
+  <img src="docs/screenshots/package-run.png" width="85%" alt="打包执行界面">
+  <br>
+  <em>打包工具执行过程：文件检查 → 资源复制 → 启动脚本生成 → 压缩包制作</em>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/package-complete.png" width="85%" alt="打包完成界面">
+  <br>
+  <em>打包完成，生成跨平台便携压缩包与使用说明</em>
+</p>
 
 ---
 
@@ -338,6 +450,48 @@ curl -N -X POST http://localhost:8000/api/chat/stream \
 - 引入 LoRA / QLoRA 降低微调显存占用，并扩大训练数据规模。
 - 将可视化与评估报告对接真实测评指标（BLEU / ROUGE / 人工打分）。
 - 打包时内置依赖与模型下载引导，做到真正离线可分发的便携包。
+
+---
+
+## 界面与功能演示（来自实验报告）
+
+以下截图来自实验报告中的真实运行界面，展示了 API 文档、Web 对话、代码示例、系统状态、发送状态、服务信息、对话日志与模型测试结果。
+
+### API 文档
+
+| API 首页 | `/api/chat` 接口详情 |
+|:---:|:---:|
+| <img src="docs/screenshots/api-docs-overview.png" width="420"> | <img src="docs/screenshots/api-docs-chat-endpoint.png" width="420"> |
+| Swagger UI 首页 | POST /api/chat 请求与响应结构 |
+
+### Web 对话界面
+
+| 主界面 | 多轮对话示例 |
+|:---:|:---:|
+| <img src="docs/screenshots/web-chat-interface.png" width="420"> | <img src="docs/screenshots/chat-conversation.png" width="420"> |
+| 示例问题快捷入口 + 对话区域 | “你好 / 介绍一下你自己”对话交互 |
+
+| 代码示例 | 系统状态 |
+|:---:|:---:|
+| <img src="docs/screenshots/web-code-example.png" width="420"> | <img src="docs/screenshots/web-system-status.png" width="420"> |
+| 请求“写一个简单的问候函数” | 模型加载与连接状态 |
+
+| 发送中状态 |
+|:---:|
+| <img src="docs/screenshots/chat-sending-state.png" width="420"> |
+| 输入“你好”后，界面显示生成中的实时反馈 |
+
+### 服务信息、日志与测试结果
+
+| 服务器启动信息 | 终端对话日志 |
+|:---:|:---:|
+| <img src="docs/screenshots/server-info-terminal.png" width="420"> | <img src="docs/screenshots/chat-log-terminal.png" width="420"> |
+| API 服务启动后的终端信息 | 服务端记录的对话历史 |
+
+| 模型测试结果 |
+|:---:|
+| <img src="docs/screenshots/model-test-results.png" width="600"> |
+| model_testing.py 输出的测试样本数、相似度与长度匹配率统计 |
 
 ---
 
